@@ -1,0 +1,10 @@
+---
+- name: firstplay
+  hosts: local
+  tasks:
+    - name: Example from an Ansible Playbook
+      ansible.builtin.ping:
+    - name: Prints two lines of messages, but only if there is an environment value set
+      ansible.builtin.debug:   
+         msg: System {{ inventory_hostname }} has gateway {{ ansible_default_ipv4.gateway }}
+
