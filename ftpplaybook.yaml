@@ -1,0 +1,26 @@
+---
+- name: Download and execute script from FTP
+  hosts: remote
+  become: yes
+  tasks:
+    - name: Download script from FTP
+      get_url:
+        url: "ftp://your-ftp-server/path/to/installserver.sh"
+        dest: "/tmp/installserver.sh"
+        mode: '0755'
+        # Optional: FTP credentials if required
+        url_username: "your-ftp-username"
+        url_password: "your-ftp-password"
+
+    - name: Execute the script
+      shell: /tmp/installserver.sh
+      register: script_output
+
+    - name: Display script output
+      debug:
+        msg: "{{ script_output.stdout }}"
+
+    - name: Clean up downloaded script
+      file:
+        path: /tmp/installserver.sh
+        state: absent

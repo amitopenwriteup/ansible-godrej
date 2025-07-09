@@ -1,0 +1,347 @@
+---
+- name: Sudo User Compliance Check
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars:
+    compliance_report_path: "/tmp/sudo_compliance_report.txt"
+    max_sudo_users: 5
+    required_sudo_groups: ['wheel', 'sudo']
+    
+  tasks:
+    - name: Initialize compliance report
+      copy:
+        content: |
+          ===============================================
+          SUDO USER COMPLIANCE REPORT
+          ===============================================
+          Generated: {{ ansible_date_time.iso8601 }}
+          Host: {{ inventory_hostname }}
+          ===============================================
+          
+        dest: "{{ compliance_report_path }}"
+        mode: '0644'
+
+    - name: Check if sudoers file exists and get permissions
+      stat:
+        path: /etc/sudoers
+      register: sudoers_file
+
+    - name: Verify sudoers file permissions
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "SUDOERS FILE PERMISSIONS: {{ sudoers_file.stat.mode }} (Expected: 0440)"
+        insertafter: EOF
+      when: sudoers_file.stat.exists
+
+    - name: Report sudoers file permissions compliance
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "ISSUE: /etc/sudoers has incorrect permissions: {{ sudoers_file.stat.mode }} (Expected: 0440)"
+        insertafter: EOF
+      when: sudoers_file.stat.exists and sudoers_file.stat.mode != '0440'
+
+    - name: Get all users with sudo privileges
+      shell: |
+        getent passwd | cut -d: -f1 | while read user; do
+          if sudo -l -U $user 2>/dev/null | grep -q "(ALL)"; then
+            echo $user
+          fi
+        done
+      register: sudo_users_output
+      changed_when: false
+
+    - name: Set sudo users fact
+      set_fact:
+        sudo_users: "{{ sudo_users_output.stdout_lines }}"
+
+    - name: Check number of sudo users
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "SUDO USERS COUNT: {{ sudo_users | length }} (Max allowed: {{ max_sudo_users }})"
+        insertafter: EOF
+
+    - name: List all sudo users
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "SUDO USERS: {{ sudo_users | join(', ') }}"
+        insertafter: EOF
+
+    - name: Report sudo users count compliance
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "ISSUE: Too many sudo users ({{ sudo_users | length }} > {{ max_sudo_users }})"
+        insertafter: EOF
+      when: sudo_users | length > max_sudo_users
+
+    - name: Check for passwordless sudo entries
+      shell: grep -E "NOPASSWD|!authenticate" /etc/sudoers /etc/sudoers.d/* 2>/dev/null || true
+      register: nopasswd_sudo
+      changed_when: false
+
+    - name: Report passwordless sudo compliance
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "ISSUE: Passwordless sudo entries found ({{ nopasswd_sudo.stdout_lines | length }} entries)"
+        insertafter: EOF
+      when: nopasswd_sudo.stdout_lines | length > 0
+
+    - name: List passwordless sudo entries
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "{{ item }}"
+        insertafter: EOF
+      loop: "{{ nopasswd_sudo.stdout_lines }}"
+      when: nopasswd_sudo.stdout_lines | length > 0
+
+    - name: Check sudo group membership
+      shell: |
+        for group in {{ required_sudo_groups | join(' ') }}; do
+          if getent group $group >/dev/null 2>&1; then
+            echo "$group: $(getent group $group | cut -d: -f4)"
+          else
+            echo "$group: GROUP_NOT_FOUND"
+          fi
+        done
+      register: sudo_groups_output
+      changed_when: false
+
+    - name: Report sudo group memberships
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "SUDO GROUP MEMBERSHIPS:"
+        insertafter: EOF
+
+    - name: List sudo group memberships
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "  {{ item }}"
+        insertafter: EOF
+      loop: "{{ sudo_groups_output.stdout_lines }}"
+
+    - name: Check for root login
+      shell: passwd -S root | awk '{print $2}'
+      register: root_status
+      changed_when: false
+
+    - name: Report root account compliance
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "ISSUE: Root account is enabled (Status: {{ root_status.stdout }})"
+        insertafter: EOF
+      when: root_status.stdout != "L"
+
+    - name: Report root account status (compliant)
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "ROOT ACCOUNT STATUS: {{ root_status.stdout }} (Compliant - Locked)"
+        insertafter: EOF
+      when: root_status.stdout == "L"
+
+    - name: Report root account status (non-compliant)
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "ROOT ACCOUNT STATUS: {{ root_status.stdout }} (Non-compliant - Should be locked)"
+        insertafter: EOF
+      when: root_status.stdout != "L"
+
+    - name: Check sudo log configuration
+      shell: |
+        if grep -q "log_output" /etc/sudoers /etc/sudoers.d/* 2>/dev/null; then
+          echo "ENABLED"
+        else
+          echo "DISABLED"
+        fi
+      register: sudo_logging
+      changed_when: false
+
+    - name: Report sudo logging compliance
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "ISSUE: Sudo logging is disabled (Recommended: Enable logging)"
+        insertafter: EOF
+      when: sudo_logging.stdout == "DISABLED"
+
+    - name: Report sudo logging status (compliant)
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "SUDO LOGGING: {{ sudo_logging.stdout }} (Compliant)"
+        insertafter: EOF
+      when: sudo_logging.stdout == "ENABLED"
+
+    - name: Report sudo logging status (non-compliant)
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "SUDO LOGGING: {{ sudo_logging.stdout }} (Non-compliant - Should be enabled)"
+        insertafter: EOF
+      when: sudo_logging.stdout == "DISABLED"
+
+    - name: Check for sudo timeout configuration
+      shell: |
+        timeout=$(grep -h "timestamp_timeout" /etc/sudoers /etc/sudoers.d/* 2>/dev/null | head -1 | awk '{print $3}')
+        if [ -n "$timeout" ]; then
+          echo "$timeout"
+        else
+          echo "15 (default)"
+        fi
+      register: sudo_timeout
+      changed_when: false
+
+    - name: Report sudo timeout compliance
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "ISSUE: Sudo timeout too high ({{ sudo_timeout.stdout }} minutes, recommended: ≤15 minutes)"
+        insertafter: EOF
+      when: sudo_timeout.stdout | int > 15
+
+    - name: Report sudo timeout status (compliant)
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "SUDO TIMEOUT: {{ sudo_timeout.stdout }} minutes (Compliant)"
+        insertafter: EOF
+      when: sudo_timeout.stdout | int <= 15
+
+    - name: Report sudo timeout status (non-compliant)
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "SUDO TIMEOUT: {{ sudo_timeout.stdout }} minutes (Non-compliant - Should be ≤15 minutes)"
+        insertafter: EOF
+      when: sudo_timeout.stdout | int > 15
+
+    - name: Check for insecure sudo configurations
+      shell: |
+        insecure_configs=""
+        if grep -q "ALL.*ALL.*NOPASSWD.*ALL" /etc/sudoers /etc/sudoers.d/* 2>/dev/null; then
+          insecure_configs="$insecure_configs NOPASSWD_ALL"
+        fi
+        if grep -q "!requiretty" /etc/sudoers /etc/sudoers.d/* 2>/dev/null; then
+          insecure_configs="$insecure_configs NO_TTY_REQUIRED"
+        fi
+        if grep -q "env_reset" /etc/sudoers /etc/sudoers.d/* 2>/dev/null; then
+          echo "SECURE"
+        else
+          insecure_configs="$insecure_configs NO_ENV_RESET"
+        fi
+        echo "$insecure_configs"
+      register: insecure_configs
+      changed_when: false
+
+    - name: Report insecure configurations compliance
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "ISSUE: Insecure sudo configurations found: {{ insecure_configs.stdout }}"
+        insertafter: EOF
+      when: insecure_configs.stdout != "SECURE" and insecure_configs.stdout | length > 0
+
+    - name: Report security configuration status (compliant)
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "SECURITY CONFIGURATIONS: SECURE (Compliant)"
+        insertafter: EOF
+      when: insecure_configs.stdout == "SECURE"
+
+    - name: Report security configuration status (non-compliant)
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "SECURITY CONFIGURATIONS: ISSUES FOUND - {{ insecure_configs.stdout }} (Non-compliant)"
+        insertafter: EOF
+      when: insecure_configs.stdout != "SECURE" and insecure_configs.stdout | length > 0
+
+    - name: Check recent sudo usage
+      shell: |
+        if [ -f /var/log/auth.log ]; then
+          grep "sudo:" /var/log/auth.log | tail -5
+        elif [ -f /var/log/secure ]; then
+          grep "sudo:" /var/log/secure | tail -5
+        else
+          echo "No sudo logs found"
+        fi
+      register: recent_sudo_usage
+      changed_when: false
+
+    - name: Report recent sudo usage
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "RECENT SUDO USAGE:"
+        insertafter: EOF
+
+    - name: List recent sudo usage
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "  {{ item }}"
+        insertafter: EOF
+      loop: "{{ recent_sudo_usage.stdout_lines }}"
+      when: recent_sudo_usage.stdout_lines | length > 0
+
+    - name: Add compliance summary
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: |
+          
+          ===============================================
+          COMPLIANCE SUMMARY
+          ===============================================
+        insertafter: EOF
+
+    - name: Count non-compliant items
+      shell: |
+        issues=0
+        if [ "{{ sudoers_file.stat.mode }}" != "0440" ]; then
+          issues=$((issues + 1))
+        fi
+        if [ "{{ sudo_users | length }}" -gt "{{ max_sudo_users }}" ]; then
+          issues=$((issues + 1))
+        fi
+        if [ "{{ nopasswd_sudo.stdout_lines | length }}" -gt "0" ]; then
+          issues=$((issues + 1))
+        fi
+        if [ "{{ root_status.stdout }}" != "L" ]; then
+          issues=$((issues + 1))
+        fi
+        if [ "{{ sudo_logging.stdout }}" = "DISABLED" ]; then
+          issues=$((issues + 1))
+        fi
+        if [ "{{ sudo_timeout.stdout | int }}" -gt "15" ]; then
+          issues=$((issues + 1))
+        fi
+        if [ "{{ insecure_configs.stdout }}" != "SECURE" ] && [ -n "{{ insecure_configs.stdout }}" ]; then
+          issues=$((issues + 1))
+        fi
+        echo "$issues"
+      register: non_compliant_count
+      changed_when: false
+
+    - name: Report final compliance status
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "OVERALL STATUS: {{ 'COMPLIANT' if non_compliant_count.stdout == '0' else 'NON-COMPLIANT' }} ({{ non_compliant_count.stdout }} issues found)"
+        insertafter: EOF
+
+    - name: Add non-compliant items summary
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: |
+          
+          NON-COMPLIANT ITEMS SUMMARY:
+          1. Sudoers file permissions: {{ 'FAIL' if sudoers_file.stat.mode != '0440' else 'PASS' }}
+          2. Sudo users count: {{ 'FAIL' if sudo_users | length > max_sudo_users else 'PASS' }}
+          3. Passwordless sudo entries: {{ 'FAIL' if nopasswd_sudo.stdout_lines | length > 0 else 'PASS' }}
+          4. Root account locked: {{ 'FAIL' if root_status.stdout != 'L' else 'PASS' }}
+          5. Sudo logging enabled: {{ 'FAIL' if sudo_logging.stdout == 'DISABLED' else 'PASS' }}
+          6. Sudo timeout appropriate: {{ 'FAIL' if sudo_timeout.stdout | int > 15 else 'PASS' }}
+          7. Secure configurations: {{ 'FAIL' if insecure_configs.stdout != 'SECURE' and insecure_configs.stdout | length > 0 else 'PASS' }}
+        insertafter: EOF
+
+    - name: Display compliance report location
+      debug:
+        msg: "Compliance report generated at: {{ compliance_report_path }}"
+
+    - name: Display compliance summary
+      debug:
+        msg: "Compliance Status: {{ 'COMPLIANT' if non_compliant_count.stdout == '0' else 'NON-COMPLIANT' }} ({{ non_compliant_count.stdout }} issues found)"
+
+    - name: Always fetch compliance report
+      fetch:
+        src: "{{ compliance_report_path }}"
+        dest: "./compliance_reports/{{ inventory_hostname }}_sudo_compliance.txt"
+        flat: yes

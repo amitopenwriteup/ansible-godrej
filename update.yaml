@@ -1,0 +1,295 @@
+---
+- name: Red Hat Package Management and Reporting
+  hosts: redhat-servers
+  become: yes
+  gather_facts: yes
+  vars:
+    report_dir: "/tmp/package_reports"
+    timestamp: "{{ ansible_date_time.epoch }}"
+    report_file: "{{ report_dir }}/package_report_{{ inventory_hostname }}_{{ timestamp }}.txt"
+
+  tasks:
+    - name: Create report directory
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Get system information
+      setup:
+        gather_subset: 
+          - '!all'
+          - 'min'
+          - 'distribution'
+          - 'date_time'
+
+    - name: Check if system is Red Hat based
+      fail:
+        msg: "This playbook is designed for Red Hat based systems only"
+      when: ansible_os_family != "RedHat"
+
+    - name: Get list of installed packages (before update)
+      package_facts:
+        manager: "auto"
+      register: packages_before
+
+    - name: Create initial report header
+      copy:
+        content: |
+          =====================================
+          PACKAGE MANAGEMENT REPORT
+          =====================================
+          
+          Server: {{ inventory_hostname }}
+          IP Address: {{ ansible_default_ipv4.address }}
+          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Architecture: {{ ansible_architecture }}
+          Kernel: {{ ansible_kernel }}
+          Date: {{ ansible_date_time.date }}
+          Time: {{ ansible_date_time.time }}
+          
+          =====================================
+          PRE-UPDATE PACKAGE COUNT
+          =====================================
+          
+          Total installed packages: {{ ansible_facts.packages | length }}
+          
+        dest: "{{ report_file }}"
+        mode: '0644'
+
+    - name: Get available updates before patching
+      yum:
+        list: updates
+      register: available_updates
+
+    - name: Add available updates to report
+      lineinfile:
+        path: "{{ report_file }}"
+        line: |
+          
+          =====================================
+          AVAILABLE UPDATES (BEFORE PATCHING)
+          =====================================
+          
+          Number of available updates: {{ available_updates.results | length }}
+          
+        insertafter: EOF
+
+    - name: List available updates in report
+      lineinfile:
+        path: "{{ report_file }}"
+        line: "{{ item.name }}-{{ item.version }}.{{ item.arch }} ({{ item.repo }})"
+        insertafter: EOF
+      loop: "{{ available_updates.results }}"
+      when: available_updates.results | length > 0
+
+    - name: Add no updates message if none available
+      lineinfile:
+        path: "{{ report_file }}"
+        line: "No updates available"
+        insertafter: EOF
+      when: available_updates.results | length == 0
+
+    - name: Clean yum cache
+      yum:
+        name: "*"
+        state: latest
+        update_cache: yes
+      register: yum_clean
+
+    - name: Update all packages
+      yum:
+        name: "*"
+        state: latest
+        update_only: yes
+      register: update_result
+
+    - name: Get updated package facts
+      package_facts:
+        manager: "auto"
+      register: packages_after
+
+    - name: Add update results to report
+      lineinfile:
+        path: "{{ report_file }}"
+        line: |
+          
+          =====================================
+          UPDATE EXECUTION RESULTS
+          =====================================
+          
+          Update Status: {{ "SUCCESS" if update_result.changed else "NO CHANGES" }}
+          Packages Updated: {{ update_result.results | length if update_result.results is defined else 0 }}
+          
+        insertafter: EOF
+
+    - name: List updated packages in report
+      lineinfile:
+        path: "{{ report_file }}"
+        line: "Updated: {{ item }}"
+        insertafter: EOF
+      loop: "{{ update_result.results }}"
+      when: update_result.results is defined and update_result.results | length > 0
+
+    - name: Check for packages that need reboot
+      command: needs-restarting -r
+      register: reboot_check
+      failed_when: false
+      changed_when: false
+
+    - name: Add reboot requirement to report
+      lineinfile:
+        path: "{{ report_file }}"
+        line: |
+          
+          =====================================
+          REBOOT REQUIREMENT
+          =====================================
+          
+          Reboot Required: {{ "YES" if reboot_check.rc == 1 else "NO" }}
+          
+        insertafter: EOF
+
+    - name: Get post-update package count
+      lineinfile:
+        path: "{{ report_file }}"
+        line: |
+          
+          =====================================
+          POST-UPDATE PACKAGE COUNT
+          =====================================
+          
+          Total installed packages: {{ ansible_facts.packages | length }}
+          
+        insertafter: EOF
+
+    - name: Check for remaining available updates
+      yum:
+        list: updates
+      register: remaining_updates
+
+    - name: Add remaining updates to report
+      lineinfile:
+        path: "{{ report_file }}"
+        line: |
+          
+          =====================================
+          REMAINING AVAILABLE UPDATES
+          =====================================
+          
+          Number of remaining updates: {{ remaining_updates.results | length }}
+          
+        insertafter: EOF
+
+    - name: List remaining updates in report
+      lineinfile:
+        path: "{{ report_file }}"
+        line: "{{ item.name }}-{{ item.version }}.{{ item.arch }} ({{ item.repo }})"
+        insertafter: EOF
+      loop: "{{ remaining_updates.results }}"
+      when: remaining_updates.results | length > 0
+
+    - name: Add no remaining updates message
+      lineinfile:
+        path: "{{ report_file }}"
+        line: "No remaining updates available"
+        insertafter: EOF
+      when: remaining_updates.results | length == 0
+
+    - name: Get security updates info
+      command: yum --security check-update
+      register: security_updates
+      failed_when: false
+      changed_when: false
+
+    - name: Add security updates to report
+      lineinfile:
+        path: "{{ report_file }}"
+        line: |
+          
+          =====================================
+          SECURITY UPDATES STATUS
+          =====================================
+          
+          Security Updates Available: {{ "YES" if security_updates.rc == 100 else "NO" }}
+          
+        insertafter: EOF
+
+    - name: Add report footer
+      lineinfile:
+        path: "{{ report_file }}"
+        line: |
+          
+          =====================================
+          REPORT COMPLETED
+          =====================================
+          
+          Report generated at: {{ ansible_date_time.date }} {{ ansible_date_time.time }}
+          Report location: {{ report_file }}
+          
+        insertafter: EOF
+
+    - name: Display report location
+      debug:
+        msg: "Package management report saved to: {{ report_file }}"
+
+    - name: Fetch report to local machine
+      fetch:
+        src: "{{ report_file }}"
+        dest: "./reports/"
+        flat: yes
+      when: inventory_hostname != 'localhost'
+
+  handlers:
+    - name: restart server
+      reboot:
+        msg: "Reboot initiated by Ansible package update"
+        pre_reboot_delay: 0
+        post_reboot_delay: 30
+        test_command: whoami
+      when: reboot_check.rc == 1 and auto_reboot | default(false)
+
+# Additional playbook for detailed package analysis
+- name: Detailed Package Analysis (Optional)
+  hosts: redhat_servers
+  become: yes
+  gather_facts: no
+  vars:
+    detailed_report_dir: "/tmp/detailed_package_reports"
+    detailed_report_file: "{{ detailed_report_dir }}/detailed_packages_{{ inventory_hostname }}_{{ ansible_date_time.epoch }}.txt"
+  
+  tasks:
+    - name: Create detailed report directory
+      file:
+        path: "{{ detailed_report_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Generate detailed package list
+      shell: |
+        echo "====================================="
+        echo "DETAILED PACKAGE INFORMATION"
+        echo "====================================="
+        echo ""
+        echo "Packages by size (Top 20):"
+        rpm -qa --queryformat '%{SIZE} %{NAME}-%{VERSION}-%{RELEASE}\n' | sort -nr | head -20
+        echo ""
+        echo "Recently installed packages (Last 30 days):"
+        rpm -qa --queryformat '%{INSTALLTIME:date} %{NAME}-%{VERSION}-%{RELEASE}\n' | sort | tail -20
+        echo ""
+        echo "Packages with available updates:"
+        yum list updates 2>/dev/null | grep -v "^Loaded\|^Updated\|^Available" | head -50
+      register: detailed_info
+
+    - name: Save detailed package information
+      copy:
+        content: "{{ detailed_info.stdout }}"
+        dest: "{{ detailed_report_file }}"
+        mode: '0644'
+
+    - name: Fetch detailed report to local machine
+      fetch:
+        src: "{{ detailed_report_file }}"
+        dest: "./detailed_reports/"
+        flat: yes
+      when: inventory_hostname != 'localhost'

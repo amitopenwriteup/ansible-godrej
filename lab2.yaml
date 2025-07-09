@@ -1,5 +1,7 @@
 - name: firstplay
   hosts: local
+  vars_files:
+    - test.yml
   gather_facts: no
   tasks:
     - name: Example from an Ansible Playbook
