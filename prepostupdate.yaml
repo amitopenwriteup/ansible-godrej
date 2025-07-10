@@ -8,6 +8,7 @@
     timestamp: "{{ ansible_date_time.epoch }}"
     report_file: "{{ report_dir }}/package_report_{{ inventory_hostname }}_{{ timestamp }}.txt"
     service_failures: []
+    package_version_changes: []
 
   tasks:
     - name: Create report directory
@@ -47,6 +48,12 @@
       package_facts:
         manager: "auto"
       register: packages_before
+
+    - name: Get detailed package versions before update
+      shell: |
+        rpm -qa --queryformat '%{NAME}|%{VERSION}|%{RELEASE}|%{ARCH}\n' | sort
+      register: detailed_packages_before
+      changed_when: false
 
     - name: Create initial report header
       copy:
@@ -128,6 +135,36 @@
         manager: "auto"
       register: packages_after
 
+    - name: Get detailed package versions after update
+      shell: |
+        rpm -qa --queryformat '%{NAME}|%{VERSION}|%{RELEASE}|%{ARCH}\n' | sort
+      register: detailed_packages_after
+      changed_when: false
+
+    - name: Compare package versions and identify changes
+      shell: |
+        echo "{{ detailed_packages_before.stdout }}" > /tmp/packages_before.txt
+        echo "{{ detailed_packages_after.stdout }}" > /tmp/packages_after.txt
+        
+        # Find packages that have different versions
+        join -t'|' -1 1 -2 1 \
+          <(sort -t'|' -k1,1 /tmp/packages_before.txt) \
+          <(sort -t'|' -k1,1 /tmp/packages_after.txt) | \
+        while IFS='|' read -r name ver1 rel1 arch1 ver2 rel2 arch2; do
+          if [[ "$ver1-$rel1" != "$ver2-$rel2" ]]; then
+            echo "$name|$ver1-$rel1|$ver2-$rel2|$arch1"
+          fi
+        done
+        
+        # Clean up temporary files
+        rm -f /tmp/packages_before.txt /tmp/packages_after.txt
+      register: package_version_changes_raw
+      changed_when: false
+
+    - name: Process package version changes
+      set_fact:
+        package_version_changes: "{{ package_version_changes_raw.stdout_lines }}"
+
     # POST-CHECK: Verify services are still running
     - name: Get list of running services (post-check)
       shell: |
@@ -172,17 +209,37 @@
           =====================================
           
           Update Status: {{ "SUCCESS" if update_result.changed else "NO CHANGES" }}
-          Packages Updated: {{ update_result.results | length if update_result.results is defined else 0 }}
+          Packages Updated: {{ package_version_changes | length }}
           
         insertafter: EOF
 
-    - name: List updated packages in report
+    - name: List updated packages with version changes in report
       lineinfile:
         path: "{{ report_file }}"
-        line: "Updated: {{ item }}"
+        line: |
+          
+          =====================================
+          PACKAGE VERSION CHANGES
+          =====================================
+          
+          Number of packages with version changes: {{ package_version_changes | length }}
+          
         insertafter: EOF
-      loop: "{{ update_result.results }}"
-      when: update_result.results is defined and update_result.results | length > 0
+
+    - name: Add detailed package version changes to report
+      lineinfile:
+        path: "{{ report_file }}"
+        line: "{{ item.split('|')[0] }}: {{ item.split('|')[1] }} → {{ item.split('|')[2] }} ({{ item.split('|')[3] }})"
+        insertafter: EOF
+      loop: "{{ package_version_changes }}"
+      when: package_version_changes | length > 0
+
+    - name: Add no package changes message
+      lineinfile:
+        path: "{{ report_file }}"
+        line: "No package version changes detected"
+        insertafter: EOF
+      when: package_version_changes | length == 0
 
     - name: Add service monitoring results to report
       lineinfile:
@@ -216,6 +273,12 @@
       failed_when: false
       changed_when: false
 
+    - name: Check for services that need restart
+      command: needs-restarting -s
+      register: services_need_restart
+      failed_when: false
+      changed_when: false
+
     - name: Add reboot requirement to report
       lineinfile:
         path: "{{ report_file }}"
@@ -226,6 +289,9 @@
           =====================================
           
           Reboot Required: {{ "YES" if reboot_check.rc == 1 else "NO" }}
+          
+          Services that need restart:
+          {{ services_need_restart.stdout if services_need_restart.stdout else 'None' }}
           
         insertafter: EOF
 
@@ -294,6 +360,24 @@
           
         insertafter: EOF
 
+    - name: Add package update summary to report
+      lineinfile:
+        path: "{{ report_file }}"
+        line: |
+          
+          =====================================
+          PACKAGE UPDATE SUMMARY
+          =====================================
+          
+          Total packages before update: {{ detailed_packages_before.stdout_lines | length }}
+          Total packages after update: {{ detailed_packages_after.stdout_lines | length }}
+          Packages with version changes: {{ package_version_changes | length }}
+          
+          Top 10 Most Critical Package Updates:
+          {{ (package_version_changes | select('match', '.*(kernel|glibc|openssl|systemd|bash|openssh).*') | list)[:10] | join('\n') if package_version_changes | select('match', '.*(kernel|glibc|openssl|systemd|bash|openssh).*') | list else 'No critical system packages updated' }}
+          
+        insertafter: EOF
+
     - name: Add failure summary to report
       lineinfile:
         path: "{{ report_file }}"
@@ -329,6 +413,14 @@
         msg: |
           Package management report saved to: {{ report_file }}
           Status: {{ "WARNING - " + (service_failures | length | string) + " issues detected" if service_failures | length > 0 else "SUCCESS - No issues detected" }}
+          Packages updated: {{ package_version_changes | length }}
+
+    - name: Display package version changes summary
+      debug:
+        msg: |
+          Package Version Changes Summary:
+          {{ package_version_changes[:10] | join('\n') if package_version_changes | length > 0 else 'No package version changes detected' }}
+          {{ '... and ' + ((package_version_changes | length - 10) | string) + ' more packages updated' if package_version_changes | length > 10 else '' }}
 
     - name: Display service failures if any
       debug:
@@ -385,6 +477,9 @@
         echo "Recently installed packages (Last 30 days):"
         rpm -qa --queryformat '%{INSTALLTIME:date} %{NAME}-%{VERSION}-%{RELEASE}\n' | sort | tail -20
         echo ""
+        echo "Package installation history:"
+        rpm -qa --queryformat '%{INSTALLTIME:date} %{NAME}-%{VERSION}-%{RELEASE} %{PACKAGER}\n' | sort | tail -50
+        echo ""
         echo "=== SERVICE INFORMATION ==="
         echo "All systemd services status:"
         systemctl list-units --type=service --all --no-pager
@@ -402,6 +497,10 @@
         echo "=== NETWORK SERVICES ==="
         echo "Listening ports:"
         netstat -tlnp 2>/dev/null | head -20
+        echo ""
+        echo "=== PACKAGE DEPENDENCIES ==="
+        echo "Packages with most dependencies:"
+        rpm -qa --queryformat '%{NAME} %{REQUIRENAME}\n' | awk '{print $1}' | sort | uniq -c | sort -nr | head -20
       register: detailed_analysis
 
     - name: Save detailed analysis
