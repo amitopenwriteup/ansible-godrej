@@ -1,0 +1,324 @@
+---
+- name: Linux VM Compliance Check and Remediation
+  hosts: all
+  become: yes
+  gather_facts: yes
+  vars:
+    compliance_report_path: "/tmp/vm_compliance_report.txt"
+    required_dns_servers:
+      - "192.168.111.134"
+      - "192.168.111.135"
+    required_ntp_server: "192.168.111.134"
+    backup_suffix: ".compliance_backup"
+    
+  tasks:
+    - name: Initialize compliance report
+      copy:
+        content: |
+          ===============================================
+          LINUX VM COMPLIANCE REPORT
+          ===============================================
+          Generated: {{ ansible_date_time.iso8601 }}
+          Host: {{ inventory_hostname }}
+          IP: {{ ansible_default_ipv4.address }}
+          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          ===============================================
+          
+        dest: "{{ compliance_report_path }}"
+        mode: '0644'
+
+    # DNS Configuration Check and Remediation
+    - name: Check current DNS configuration
+      slurp:
+        src: /etc/resolv.conf
+      register: resolv_conf_content
+
+    - name: Parse current DNS servers
+      set_fact:
+        current_dns_servers: "{{ resolv_conf_content.content | b64decode | regex_findall('nameserver\\s+(\\S+)') }}"
+
+    - name: Report current DNS configuration
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "CURRENT DNS SERVERS: {{ current_dns_servers | join(', ') if current_dns_servers | length > 0 else 'None configured' }}"
+        insertafter: EOF
+
+    - name: Check DNS compliance
+      set_fact:
+        dns_compliant: "{{ required_dns_servers | difference(current_dns_servers) | length == 0 }}"
+
+    - name: Report DNS compliance status
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "DNS COMPLIANCE: {{ 'COMPLIANT' if dns_compliant else 'NON-COMPLIANT' }} (Required: {{ required_dns_servers | join(', ') }})"
+        insertafter: EOF
+
+    - name: Backup current resolv.conf
+      copy:
+        src: /etc/resolv.conf
+        dest: "/etc/resolv.conf{{ backup_suffix }}"
+        remote_src: yes
+      when: not dns_compliant
+
+    - name: Clear existing nameservers
+      lineinfile:
+        path: /etc/resolv.conf
+        regexp: "^nameserver\\s+.*"
+        state: absent
+      when: not dns_compliant
+
+    - name: Configure required DNS servers
+      lineinfile:
+        path: /etc/resolv.conf
+        line: "nameserver {{ item }}"
+        insertafter: EOF
+        create: yes
+      loop: "{{ required_dns_servers }}"
+      when: not dns_compliant
+
+    - name: Report DNS remediation
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "DNS REMEDIATION: Applied - Set nameservers to {{ required_dns_servers | join(', ') }}"
+        insertafter: EOF
+      when: not dns_compliant
+
+    # IPv6 Configuration Check and Remediation
+    - name: Check current IPv6 status
+      shell: |
+        if sysctl net.ipv6.conf.all.disable_ipv6 | grep -q "= 0"; then
+          echo "ENABLED"
+        else
+          echo "DISABLED"
+        fi
+      register: ipv6_status
+      changed_when: false
+
+    - name: Report current IPv6 status
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "CURRENT IPv6 STATUS: {{ ipv6_status.stdout }}"
+        insertafter: EOF
+
+    - name: Check IPv6 compliance
+      set_fact:
+        ipv6_compliant: "{{ ipv6_status.stdout == 'DISABLED' }}"
+
+    - name: Report IPv6 compliance status
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "IPv6 COMPLIANCE: {{ 'COMPLIANT' if ipv6_compliant else 'NON-COMPLIANT' }} (Required: DISABLED)"
+        insertafter: EOF
+
+    - name: Backup current sysctl.conf
+      copy:
+        src: /etc/sysctl.conf
+        dest: "/etc/sysctl.conf{{ backup_suffix }}"
+        remote_src: yes
+      when: not ipv6_compliant
+
+    - name: Disable IPv6 in sysctl.conf
+      blockinfile:
+        path: /etc/sysctl.conf
+        block: |
+          # Disable IPv6 - Compliance Configuration
+          net.ipv6.conf.all.disable_ipv6 = 1
+          net.ipv6.conf.default.disable_ipv6 = 1
+          net.ipv6.conf.lo.disable_ipv6 = 1
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - IPv6 DISABLE"
+        create: yes
+      when: not ipv6_compliant
+
+    - name: Apply IPv6 settings immediately
+      sysctl:
+        name: "{{ item }}"
+        value: "1"
+        state: present
+        reload: yes
+      loop:
+        - net.ipv6.conf.all.disable_ipv6
+        - net.ipv6.conf.default.disable_ipv6
+        - net.ipv6.conf.lo.disable_ipv6
+      when: not ipv6_compliant
+
+    - name: Report IPv6 remediation
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "IPv6 REMEDIATION: Applied - IPv6 disabled system-wide"
+        insertafter: EOF
+      when: not ipv6_compliant
+
+    # NTP Configuration Check and Remediation
+    - name: Check if chrony is installed
+      package_facts:
+        manager: auto
+
+    - name: Install chrony if not present
+      package:
+        name: chrony
+        state: present
+      when: "'chrony' not in ansible_facts.packages"
+
+    - name: Check current NTP configuration
+      slurp:
+        src: /etc/chrony.conf
+      register: chrony_conf_content
+      ignore_errors: yes
+
+    - name: Parse current NTP servers
+      set_fact:
+        current_ntp_servers: "{{ chrony_conf_content.content | b64decode | regex_findall('(?:server|pool)\\s+(\\S+)') if chrony_conf_content.content is defined else [] }}"
+
+    - name: Report current NTP configuration
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "CURRENT NTP SERVERS: {{ current_ntp_servers | join(', ') if current_ntp_servers | length > 0 else 'None configured' }}"
+        insertafter: EOF
+
+    - name: Check NTP compliance
+      set_fact:
+        ntp_compliant: "{{ required_ntp_server in current_ntp_servers }}"
+
+    - name: Report NTP compliance status
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "NTP COMPLIANCE: {{ 'COMPLIANT' if ntp_compliant else 'NON-COMPLIANT' }} (Required: {{ required_ntp_server }})"
+        insertafter: EOF
+
+    - name: Backup current chrony.conf
+      copy:
+        src: /etc/chrony.conf
+        dest: "/etc/chrony.conf{{ backup_suffix }}"
+        remote_src: yes
+      when: not ntp_compliant
+
+    - name: Configure NTP server in chrony.conf
+      lineinfile:
+        path: /etc/chrony.conf
+        line: "server {{ required_ntp_server }} iburst"
+        insertbefore: BOF
+        create: yes
+      when: not ntp_compliant
+
+    - name: Remove other NTP servers from chrony.conf
+      lineinfile:
+        path: /etc/chrony.conf
+        regexp: "^(?:server|pool)(?!\\s+{{ required_ntp_server | regex_escape }})\\s+.*"
+        state: absent
+      when: not ntp_compliant
+
+    - name: Start and enable chrony service
+      systemd:
+        name: chronyd
+        state: restarted
+        enabled: yes
+      when: not ntp_compliant
+
+    - name: Report NTP remediation
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "NTP REMEDIATION: Applied - Set NTP server to {{ required_ntp_server }} and restarted chronyd"
+        insertafter: EOF
+      when: not ntp_compliant
+
+    # Verification of Applied Changes
+    - name: Verify DNS configuration after remediation
+      shell: dig +short @{{ item }} google.com
+      register: dns_test
+      ignore_errors: yes
+      loop: "{{ required_dns_servers }}"
+      when: not dns_compliant
+
+    - name: Report DNS verification
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "DNS VERIFICATION: {{ item.item }} - {{ 'SUCCESS' if item.rc == 0 else 'FAILED' }} ({{ 'responding' if item.rc == 0 else 'not responding' }})"
+        insertafter: EOF
+      loop: "{{ dns_test.results }}"
+      when: not dns_compliant and dns_test.results is defined
+
+    - name: Verify IPv6 is disabled
+      shell: |
+        if sysctl net.ipv6.conf.all.disable_ipv6 | grep -q "= 1"; then
+          echo "SUCCESS"
+        else
+          echo "FAILED"
+        fi
+      register: ipv6_verification
+      when: not ipv6_compliant
+
+    - name: Report IPv6 verification
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "IPv6 VERIFICATION: {{ ipv6_verification.stdout }} - IPv6 {{ 'successfully disabled' if ipv6_verification.stdout == 'SUCCESS' else 'disable failed' }}"
+        insertafter: EOF
+      when: not ipv6_compliant
+
+    - name: Verify NTP synchronization
+      shell: chrony sources -v | grep "{{ required_ntp_server }}"
+      register: ntp_verification
+      ignore_errors: yes
+      when: not ntp_compliant
+
+    - name: Report NTP verification
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: "NTP VERIFICATION: {{ 'SUCCESS' if ntp_verification.rc == 0 else 'FAILED' }} - NTP server {{ required_ntp_server }} {{ 'synchronized' if ntp_verification.rc == 0 else 'not synchronized' }}"
+        insertafter: EOF
+      when: not ntp_verification is skipped
+
+    # Final Compliance Summary
+    - name: Add compliance summary
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: |
+          
+          ===============================================
+          COMPLIANCE SUMMARY
+          ===============================================
+        insertafter: EOF
+
+    - name: Calculate final compliance status
+      set_fact:
+        final_dns_compliant: "{{ dns_compliant or (not dns_compliant and dns_test.results | selectattr('rc', 'equalto', 0) | list | length > 0) }}"
+        final_ipv6_compliant: "{{ ipv6_compliant or (not ipv6_compliant and ipv6_verification.stdout == 'SUCCESS') }}"
+        final_ntp_compliant: "{{ ntp_compliant or (not ntp_compliant and ntp_verification.rc == 0) }}"
+
+    - name: Report final compliance status
+      lineinfile:
+        path: "{{ compliance_report_path }}"
+        line: |
+          DNS: {{ 'COMPLIANT' if final_dns_compliant else 'NON-COMPLIANT' }}
+          IPv6: {{ 'COMPLIANT' if final_ipv6_compliant else 'NON-COMPLIANT' }}
+          NTP: {{ 'COMPLIANT' if final_ntp_compliant else 'NON-COMPLIANT' }}
+          
+          OVERALL STATUS: {{ 'FULLY COMPLIANT' if (final_dns_compliant and final_ipv6_compliant and final_ntp_compliant) else 'PARTIALLY COMPLIANT' }}
+          
+          BACKUP FILES CREATED:
+          - /etc/resolv.conf{{ backup_suffix }} (if DNS was modified)
+          - /etc/sysctl.conf{{ backup_suffix }} (if IPv6 was modified)
+          - /etc/chrony.conf{{ backup_suffix }} (if NTP was modified)
+        insertafter: EOF
+
+    - name: Display compliance report location
+      debug:
+        msg: "Compliance report generated at: {{ compliance_report_path }}"
+
+    - name: Display actions taken
+      debug:
+        msg: |
+          Actions taken:
+          - DNS: {{ 'Remediated' if not dns_compliant else 'Already compliant' }}
+          - IPv6: {{ 'Disabled' if not ipv6_compliant else 'Already disabled' }}
+          - NTP: {{ 'Configured' if not ntp_compliant else 'Already configured' }}
+
+    - name: Fetch compliance report
+      fetch:
+        src: "{{ compliance_report_path }}"
+        dest: "./compliance_reports/{{ inventory_hostname }}_vm_compliance.txt"
+        flat: yes
+
+    - name: Recommend reboot if IPv6 was modified
+      debug:
+        msg: "RECOMMENDATION: Reboot the system to ensure IPv6 is fully disabled"
+      when: not ipv6_compliant

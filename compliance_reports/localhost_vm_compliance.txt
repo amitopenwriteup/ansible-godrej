@@ -1,0 +1,33 @@
+===============================================
+LINUX VM COMPLIANCE REPORT
+===============================================
+Generated: 2025-07-10T03:32:35Z
+Host: localhost
+IP: 192.168.111.134
+OS: RedHat 9.6
+===============================================
+CURRENT DNS SERVERS: 8.8.8.8
+DNS COMPLIANCE: NON-COMPLIANT (Required: 192.168.111.134, 192.168.111.135)
+DNS REMEDIATION: Applied - Set nameservers to 192.168.111.134, 192.168.111.135
+CURRENT IPv6 STATUS: DISABLED
+IPv6 COMPLIANCE: COMPLIANT (Required: DISABLED)
+CURRENT NTP SERVERS: 192.168.111.134, (https://www.pool.ntp.org/join.html).
+NTP COMPLIANCE: COMPLIANT (Required: 192.168.111.134)
+DNS VERIFICATION: 192.168.111.134 - SUCCESS (responding)
+DNS VERIFICATION: 192.168.111.135 - FAILED (not responding)
+
+===============================================
+COMPLIANCE SUMMARY
+===============================================
+
+DNS: COMPLIANT
+IPv6: COMPLIANT
+NTP: COMPLIANT
+
+OVERALL STATUS: FULLY COMPLIANT
+
+BACKUP FILES CREATED:
+- /etc/resolv.conf.compliance_backup (if DNS was modified)
+- /etc/sysctl.conf.compliance_backup (if IPv6 was modified)
+- /etc/chrony.conf.compliance_backup (if NTP was modified)
+
