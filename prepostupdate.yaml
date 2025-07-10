@@ -1,0 +1,448 @@
+---
+- name: Red Hat Package Management and Reporting with Service Monitoring
+  hosts: redhat-servers
+  become: yes
+  gather_facts: yes
+  vars:
+    report_dir: "/tmp/package_reports"
+    timestamp: "{{ ansible_date_time.epoch }}"
+    report_file: "{{ report_dir }}/package_report_{{ inventory_hostname }}_{{ timestamp }}.txt"
+    service_failures: []
+
+  tasks:
+    - name: Create report directory
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Get system information
+      setup:
+        gather_subset: 
+          - '!all'
+          - 'min'
+          - 'distribution'
+          - 'date_time'
+
+    - name: Check if system is Red Hat based
+      fail:
+        msg: "This playbook is designed for Red Hat based systems only"
+      when: ansible_os_family != "RedHat"
+
+    # PRE-CHECK: Capture running services
+    - name: Get list of running services (pre-check)
+      shell: |
+        systemctl list-units --type=service --state=running --no-pager --no-legend | awk '{print $1}' | sort
+      register: services_before
+      changed_when: false
+
+    - name: Get detailed service status (pre-check)
+      shell: |
+        systemctl list-units --type=service --state=running --no-pager --no-legend | 
+        awk '{print $1 " " $2 " " $3 " " $4}'
+      register: detailed_services_before
+      changed_when: false
+
+    - name: Get list of installed packages (before update)
+      package_facts:
+        manager: "auto"
+      register: packages_before
+
+    - name: Create initial report header
+      copy:
+        content: |
+          =====================================
+          PACKAGE MANAGEMENT REPORT
+          =====================================
+          
+          Server: {{ inventory_hostname }}
+          IP Address: {{ ansible_default_ipv4.address }}
+          OS: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Architecture: {{ ansible_architecture }}
+          Kernel: {{ ansible_kernel }}
+          Date: {{ ansible_date_time.date }}
+          Time: {{ ansible_date_time.time }}
+          
+          =====================================
+          PRE-UPDATE SYSTEM STATUS
+          =====================================
+          
+          Total installed packages: {{ ansible_facts.packages | length }}
+          Running services count: {{ services_before.stdout_lines | length }}
+          
+          Running Services (Pre-Update):
+          {{ services_before.stdout }}
+          
+        dest: "{{ report_file }}"
+        mode: '0644'
+
+    - name: Get available updates before patching
+      yum:
+        list: updates
+      register: available_updates
+
+    - name: Add available updates to report
+      lineinfile:
+        path: "{{ report_file }}"
+        line: |
+          
+          =====================================
+          AVAILABLE UPDATES (BEFORE PATCHING)
+          =====================================
+          
+          Number of available updates: {{ available_updates.results | length }}
+          
+        insertafter: EOF
+
+    - name: List available updates in report
+      lineinfile:
+        path: "{{ report_file }}"
+        line: "{{ item.name }}-{{ item.version }}.{{ item.arch }} ({{ item.repo }})"
+        insertafter: EOF
+      loop: "{{ available_updates.results }}"
+      when: available_updates.results | length > 0
+
+    - name: Add no updates message if none available
+      lineinfile:
+        path: "{{ report_file }}"
+        line: "No updates available"
+        insertafter: EOF
+      when: available_updates.results | length == 0
+
+    - name: Clean yum cache
+      yum:
+        name: "*"
+        state: latest
+        update_cache: yes
+      register: yum_clean
+
+    - name: Update all packages
+      yum:
+        name: "*"
+        state: latest
+        update_only: yes
+      register: update_result
+
+    - name: Get updated package facts
+      package_facts:
+        manager: "auto"
+      register: packages_after
+
+    # POST-CHECK: Verify services are still running
+    - name: Get list of running services (post-check)
+      shell: |
+        systemctl list-units --type=service --state=running --no-pager --no-legend | awk '{print $1}' | sort
+      register: services_after
+      changed_when: false
+
+    - name: Compare service status before and after
+      set_fact:
+        services_stopped: "{{ services_before.stdout_lines | difference(services_after.stdout_lines) }}"
+        services_started: "{{ services_after.stdout_lines | difference(services_before.stdout_lines) }}"
+
+    - name: Check for failed services
+      shell: |
+        systemctl list-units --type=service --state=failed --no-pager --no-legend | awk '{print $1}'
+      register: failed_services
+      changed_when: false
+
+    - name: Identify critical services that stopped
+      set_fact:
+        critical_services_stopped: "{{ services_stopped | select('match', '.*(ssh|network|httpd|nginx|mysql|postgresql|docker|firewall).*') | list }}"
+
+    - name: Add service status to failures list
+      set_fact:
+        service_failures: "{{ service_failures + ['Service stopped: ' + item] }}"
+      loop: "{{ critical_services_stopped }}"
+      when: critical_services_stopped | length > 0
+
+    - name: Add failed services to failures list
+      set_fact:
+        service_failures: "{{ service_failures + ['Service failed: ' + item] }}"
+      loop: "{{ failed_services.stdout_lines }}"
+      when: failed_services.stdout_lines | length > 0
+
+    - name: Add update results to report
+      lineinfile:
+        path: "{{ report_file }}"
+        line: |
+          
+          =====================================
+          UPDATE EXECUTION RESULTS
+          =====================================
+          
+          Update Status: {{ "SUCCESS" if update_result.changed else "NO CHANGES" }}
+          Packages Updated: {{ update_result.results | length if update_result.results is defined else 0 }}
+          
+        insertafter: EOF
+
+    - name: List updated packages in report
+      lineinfile:
+        path: "{{ report_file }}"
+        line: "Updated: {{ item }}"
+        insertafter: EOF
+      loop: "{{ update_result.results }}"
+      when: update_result.results is defined and update_result.results | length > 0
+
+    - name: Add service monitoring results to report
+      lineinfile:
+        path: "{{ report_file }}"
+        line: |
+          
+          =====================================
+          SERVICE MONITORING RESULTS
+          =====================================
+          
+          Services running before update: {{ services_before.stdout_lines | length }}
+          Services running after update: {{ services_after.stdout_lines | length }}
+          
+          Services that stopped during update:
+          {{ services_stopped | join('\n') if services_stopped | length > 0 else 'None' }}
+          
+          Services that started during update:
+          {{ services_started | join('\n') if services_started | length > 0 else 'None' }}
+          
+          Failed services detected:
+          {{ failed_services.stdout_lines | join('\n') if failed_services.stdout_lines | length > 0 else 'None' }}
+          
+          Critical services affected:
+          {{ critical_services_stopped | join('\n') if critical_services_stopped | length > 0 else 'None' }}
+          
+        insertafter: EOF
+
+    - name: Check for packages that need reboot
+      command: needs-restarting -r
+      register: reboot_check
+      failed_when: false
+      changed_when: false
+
+    - name: Add reboot requirement to report
+      lineinfile:
+        path: "{{ report_file }}"
+        line: |
+          
+          =====================================
+          REBOOT REQUIREMENT
+          =====================================
+          
+          Reboot Required: {{ "YES" if reboot_check.rc == 1 else "NO" }}
+          
+        insertafter: EOF
+
+    - name: Get post-update package count
+      lineinfile:
+        path: "{{ report_file }}"
+        line: |
+          
+          =====================================
+          POST-UPDATE PACKAGE COUNT
+          =====================================
+          
+          Total installed packages: {{ ansible_facts.packages | length }}
+          
+        insertafter: EOF
+
+    - name: Check for remaining available updates
+      yum:
+        list: updates
+      register: remaining_updates
+
+    - name: Add remaining updates to report
+      lineinfile:
+        path: "{{ report_file }}"
+        line: |
+          
+          =====================================
+          REMAINING AVAILABLE UPDATES
+          =====================================
+          
+          Number of remaining updates: {{ remaining_updates.results | length }}
+          
+        insertafter: EOF
+
+    - name: List remaining updates in report
+      lineinfile:
+        path: "{{ report_file }}"
+        line: "{{ item.name }}-{{ item.version }}.{{ item.arch }} ({{ item.repo }})"
+        insertafter: EOF
+      loop: "{{ remaining_updates.results }}"
+      when: remaining_updates.results | length > 0
+
+    - name: Add no remaining updates message
+      lineinfile:
+        path: "{{ report_file }}"
+        line: "No remaining updates available"
+        insertafter: EOF
+      when: remaining_updates.results | length == 0
+
+    - name: Get security updates info
+      command: yum --security check-update
+      register: security_updates
+      failed_when: false
+      changed_when: false
+
+    - name: Add security updates to report
+      lineinfile:
+        path: "{{ report_file }}"
+        line: |
+          
+          =====================================
+          SECURITY UPDATES STATUS
+          =====================================
+          
+          Security Updates Available: {{ "YES" if security_updates.rc == 100 else "NO" }}
+          
+        insertafter: EOF
+
+    - name: Add failure summary to report
+      lineinfile:
+        path: "{{ report_file }}"
+        line: |
+          
+          =====================================
+          FAILURE SUMMARY
+          =====================================
+          
+          Total Issues Detected: {{ service_failures | length }}
+          
+          {{ service_failures | join('\n') if service_failures | length > 0 else 'No failures detected' }}
+          
+        insertafter: EOF
+
+    - name: Add report footer
+      lineinfile:
+        path: "{{ report_file }}"
+        line: |
+          
+          =====================================
+          REPORT COMPLETED
+          =====================================
+          
+          Report generated at: {{ ansible_date_time.date }} {{ ansible_date_time.time }}
+          Report location: {{ report_file }}
+          Overall Status: {{ "WARNING - Issues detected" if service_failures | length > 0 else "SUCCESS - No issues" }}
+          
+        insertafter: EOF
+
+    - name: Display report location and status
+      debug:
+        msg: |
+          Package management report saved to: {{ report_file }}
+          Status: {{ "WARNING - " + (service_failures | length | string) + " issues detected" if service_failures | length > 0 else "SUCCESS - No issues detected" }}
+
+    - name: Display service failures if any
+      debug:
+        msg: "Service Issues: {{ service_failures }}"
+      when: service_failures | length > 0
+
+    - name: Fetch report to local machine
+      fetch:
+        src: "{{ report_file }}"
+        dest: "./reports/"
+        flat: yes
+      when: inventory_hostname != 'localhost'
+
+    - name: Fail playbook if critical services stopped
+      fail:
+        msg: "Critical services stopped during update: {{ critical_services_stopped | join(', ') }}"
+      when: critical_services_stopped | length > 0 and fail_on_service_stop | default(false)
+
+  handlers:
+    - name: restart server
+      reboot:
+        msg: "Reboot initiated by Ansible package update"
+        pre_reboot_delay: 0
+        post_reboot_delay: 30
+        test_command: whoami
+      when: reboot_check.rc == 1 and auto_reboot | default(false)
+
+# Additional playbook for detailed package and service analysis
+- name: Detailed Package and Service Analysis (Optional)
+  hosts: redhat_servers
+  become: yes
+  gather_facts: no
+  vars:
+    detailed_report_dir: "/tmp/detailed_package_reports"
+    detailed_report_file: "{{ detailed_report_dir }}/detailed_analysis_{{ inventory_hostname }}_{{ ansible_date_time.epoch }}.txt"
+  
+  tasks:
+    - name: Create detailed report directory
+      file:
+        path: "{{ detailed_report_dir }}"
+        state: directory
+        mode: '0755'
+
+    - name: Generate detailed package and service analysis
+      shell: |
+        echo "====================================="
+        echo "DETAILED SYSTEM ANALYSIS"
+        echo "====================================="
+        echo ""
+        echo "=== PACKAGE INFORMATION ==="
+        echo "Packages by size (Top 20):"
+        rpm -qa --queryformat '%{SIZE} %{NAME}-%{VERSION}-%{RELEASE}\n' | sort -nr | head -20
+        echo ""
+        echo "Recently installed packages (Last 30 days):"
+        rpm -qa --queryformat '%{INSTALLTIME:date} %{NAME}-%{VERSION}-%{RELEASE}\n' | sort | tail -20
+        echo ""
+        echo "=== SERVICE INFORMATION ==="
+        echo "All systemd services status:"
+        systemctl list-units --type=service --all --no-pager
+        echo ""
+        echo "=== SYSTEM HEALTH ==="
+        echo "System load:"
+        uptime
+        echo ""
+        echo "Memory usage:"
+        free -h
+        echo ""
+        echo "Disk usage:"
+        df -h
+        echo ""
+        echo "=== NETWORK SERVICES ==="
+        echo "Listening ports:"
+        netstat -tlnp 2>/dev/null | head -20
+      register: detailed_analysis
+
+    - name: Save detailed analysis
+      copy:
+        content: "{{ detailed_analysis.stdout }}"
+        dest: "{{ detailed_report_file }}"
+        mode: '0644'
+
+    - name: Fetch detailed analysis to local machine
+      fetch:
+        src: "{{ detailed_report_file }}"
+        dest: "./detailed_reports/"
+        flat: yes
+      when: inventory_hostname != 'localhost'
+
+# Service Recovery Playbook (Optional)
+- name: Service Recovery (Optional)
+  hosts: redhat_servers
+  become: yes
+  gather_facts: no
+  vars:
+    services_to_restart:
+      - httpd
+      - nginx
+      - mysql
+      - postgresql
+      - docker
+  
+  tasks:
+    - name: Check and restart critical services if they're stopped
+      systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop: "{{ services_to_restart }}"
+      register: service_restart_result
+      failed_when: false
+      when: auto_restart_services | default(false)
+
+    - name: Report service restart results
+      debug:
+        msg: "Service {{ item.item }} restart result: {{ 'SUCCESS' if item.changed else 'ALREADY RUNNING' }}"
+      loop: "{{ service_restart_result.results }}"
+      when: auto_restart_services | default(false) and service_restart_result.results is defined
