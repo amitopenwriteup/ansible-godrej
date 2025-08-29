@@ -59,5 +59,3 @@ ansible-playbook -i inventory.yaml update.yaml
 * FTP configuration compliance
 * Pre/post update checks
 * General security baselines
-
-Do you want me to extend this README with **examples of `inventory.yaml`** and maybe add **compliance categories** (PCI, CIS, ISO) for better alignment?
